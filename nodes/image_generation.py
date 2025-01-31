@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 from PIL import Image
+from nodes import MAX_RESOLUTION
+
 
 class JanusImageGeneration:
     @classmethod
@@ -40,15 +42,29 @@ class JanusImageGeneration:
                     "min": 0.0,
                     "max": 1.0
                 }),
+                "width": ("INT", {
+                    "default": 384,
+                    "min": 16,
+                    "max": MAX_RESOLUTION,
+                    "step": 8,
+                    "tooltip": "The width of the latent images in pixels."
+                }),
+                "height": ("INT", {
+                    "default": 384,
+                    "min": 16,
+                    "max": MAX_RESOLUTION,
+                    "step": 8,
+                    "tooltip": "The height of the latent images in pixels."
+                }),
             },
         }
-    
+
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
     FUNCTION = "generate_images"
     CATEGORY = "Janus-Pro"
 
-    def generate_images(self, model, processor, prompt, seed, batch_size=1, temperature=1.0, cfg_weight=5.0, top_p=0.95):
+    def generate_images(self, model, processor, prompt, seed, batch_size=1, temperature=1.0, cfg_weight=5.0, top_p=0.95, width=384, height=384):
         try:
             from janus.models import MultiModalityCausalLM
         except ImportError:
@@ -59,9 +75,12 @@ class JanusImageGeneration:
         torch.cuda.manual_seed(seed)
 
         # 图像参数设置
-        image_token_num = 576  # 24x24 patches
-        img_size = 384  # 输出图像大小
+        # image_token_num = 576  # 24x24 patches
+        # img_size = 384  # 输出图像大小
+        width = (width // 16) * 16
+        height = (height // 16) * 16
         patch_size = 16  # 每个patch的大小
+        image_token_num = (width // patch_size) * (height // patch_size)
         parallel_size = batch_size
 
         # 准备对话格式
@@ -86,8 +105,8 @@ class JanusImageGeneration:
         input_ids = torch.LongTensor(input_ids)
 
         # 准备条件和无条件输入
-        tokens = torch.zeros((parallel_size*2, len(input_ids)), dtype=torch.int).cuda()
-        for i in range(parallel_size*2):
+        tokens = torch.zeros((parallel_size * 2, len(input_ids)), dtype=torch.int).cuda()
+        for i in range(parallel_size * 2):
             tokens[i, :] = input_ids
             if i % 2 != 0:  # 无条件输入
                 tokens[i, 1:-1] = processor.pad_id
@@ -102,18 +121,18 @@ class JanusImageGeneration:
         # 自回归生成
         for i in range(image_token_num):
             outputs = model.language_model.model(
-                inputs_embeds=inputs_embeds, 
-                use_cache=True, 
+                inputs_embeds=inputs_embeds,
+                use_cache=True,
                 past_key_values=outputs.past_key_values if i != 0 else None
             )
             hidden_states = outputs.last_hidden_state
-            
+
             # 获取logits并应用CFG
             logits = model.gen_head(hidden_states[:, -1, :])
             logit_cond = logits[0::2, :]
             logit_uncond = logits[1::2, :]
-            
-            logits = logit_uncond + cfg_weight * (logit_cond-logit_uncond)
+
+            logits = logit_uncond + cfg_weight * (logit_cond - logit_uncond)
             probs = torch.softmax(logits / temperature, dim=-1)
 
             # 采样下一个token
@@ -127,38 +146,38 @@ class JanusImageGeneration:
 
         # 解码生成的tokens为图像
         dec = model.gen_vision_model.decode_code(
-            generated_tokens.to(dtype=torch.int), 
-            shape=[parallel_size, 8, img_size//patch_size, img_size//patch_size]
+            generated_tokens.to(dtype=torch.int),
+            shape=[parallel_size, 8, height // patch_size, width // patch_size]
         )
-        
+
         # 转换为numpy进行处理
         dec = dec.to(torch.float32).cpu().numpy()
-        
+
         # 确保是BCHW格式
         if dec.shape[1] != 3:
             dec = np.repeat(dec, 3, axis=1)
-        
+
         # 从[-1,1]转换到[0,1]
         dec = (dec + 1) / 2
-        
+
         # 确保值范围在[0,1]之间
         dec = np.clip(dec, 0, 1)
-        
+
         # 转换为ComfyUI需要的格式 [B,C,H,W] -> [B,H,W,C]
         dec = np.transpose(dec, (0, 2, 3, 1))
-        
+
         # 转换为tensor
         images = torch.from_numpy(dec).float()
-        
+
         # 打印详细的形状信息
         # print(f"Initial dec shape: {dec.shape}")
         # print(f"Final tensor: shape={images.shape}, dtype={images.dtype}, range=[{images.min():.3f}, {images.max():.3f}]")
-        
+
         # 确保格式正确
         assert images.ndim == 4 and images.shape[-1] == 3, f"Unexpected shape: {images.shape}"
-        
+
         return (images,)
 
     @classmethod
     def IS_CHANGED(cls, seed, **kwargs):
-        return seed 
+        return seed
